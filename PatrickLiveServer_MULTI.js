@@ -4,7 +4,7 @@ import express from "express";
 import WebSocket, { WebSocketServer } from "ws";
 
 // IMPORTAÇÃO REMOTA — SEM NPM, SEM ERRO, MENOS COISA POSSÍVEL
-import WebcastPushConnection, { SignConfig } from "https://esm.sh/tiktok-live-connector@1.5.0";
+import WebcastPushConnection, { SignConfig } from "./tiktok-live-connector/index.js";
 
 const PORT = process.env.PORT || 8080;
 
