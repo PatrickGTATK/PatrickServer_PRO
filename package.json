@@ -10,6 +10,6 @@
     "dotenv": "^16.3.1",
     "express": "^4.19.2",
     "ws": "^8.17.0",
-    "tiktok-live-connector": "1.4.3"
+    "tiktok-live-connector": "1.4.1"
   }
 }
