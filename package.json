@@ -4,20 +4,12 @@
   "main": "PatrickLiveServer_MULTI.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node PatrickLiveServer_MULTI.js",
+    "start": "node PatrickLiveServer_MULTI.js"
   },
   "dependencies": {
     "dotenv": "^16.3.1",
     "express": "^4.19.2",
-    "tiktok-live-connector": "^1.4.0"
+    "tiktok-live-connector": "^1.4.0",
     "ws": "^8.17.0"
   }
-
 }
-
-
-
-
-
-
-
