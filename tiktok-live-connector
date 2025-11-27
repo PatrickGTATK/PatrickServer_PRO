@@ -1,4 +1,3 @@
-
 import { WebcastClient } from "./client/WebcastClient.js";
 import { SignConfig } from "./utils/SignatureProvider.js";
 
