@@ -3,8 +3,11 @@ import http from "http";
 import express from "express";
 import WebSocket, { WebSocketServer } from "ws";
 
-// IMPORTAÇÃO REMOTA — SEM NPM, SEM ERRO, MENOS COISA POSSÍVEL
-import WebcastPushConnection, { SignConfig } from "./tiktok-live-connector/index.js";
+// 🚀 CORREÇÃO APLICADA:
+// Utilizando a importação padrão via node_modules.
+// Isso resolve o erro "ERR_MODULE_NOT_FOUND" no ambiente de deploy
+// (desde que a biblioteca esteja instalada via npm).
+import WebcastPushConnection, { SignConfig } from "tiktok-live-connector";
 
 const PORT = process.env.PORT || 8080;
 
@@ -113,8 +116,11 @@ function startTikTokSession(session) {
         session.tiktok = null;
     }
 
-    if (SignConfig) {
-        SignConfig.apiKey = API_KEYS[session.apiKeyIndexLocal];
+    // Apenas define a apiKey se SignConfig existir e se houver chaves
+    if (SignConfig && API_KEYS.length > 0) {
+        SignConfig.apiKey = API_KEYS[session.apiKeyIndexLocal % API_KEYS.length];
+        // Cicla o índice global para a próxima sessão, garantindo que a chave local é usada
+        apiKeyIndex = (apiKeyIndex + 1) % API_KEYS.length;
     }
 
     console.log(`\n[${username}] Conectando... (fallback=${session.fallbackMode})`);
@@ -202,7 +208,8 @@ wss.on("connection", (ws, req) => {
     ws.isAlive = true;
     ws.on("pong", () => heartbeat(ws));
 
-    const url = new URL(req.url, "http://localhost");
+    // O req.url contém o caminho com query params
+    const url = new URL(req.url, "http://localhost"); 
     const user = url.searchParams.get("user");
 
     if (!user) {
