@@ -1,1 +1,0 @@
-export function applyViewerCountPatch(){ if(!globalThis.__TIKTOK_PATCHED__) globalThis.__TIKTOK_PATCHED__=true;}
