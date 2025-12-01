@@ -17,7 +17,7 @@ import process from "process";
 // ------------------------------------------------------------
 // CONFIGURAÇÕES GLOBAIS
 // ------------------------------------------------------------
-const PORT = process.env.PORT; // CORREÇÃO APLICADA: Removido o '|| 8080'
+const PORT = process.env.PORT;
 const API_KEY = process.env.API_KEY;
 const WS_SECRET = process.env.WS_SECRET;
 const USERS = process.env.USERS?.split(",").map(u => u.trim()) || [];
@@ -268,6 +268,35 @@ class LiveClient {
                 pfp: getSafePFP(ev)
             });
         });
+        
+        // =========================================================
+        //  <<< EVENT LISTENER CHAT INSERIDO NA CORREÇÃO ANTERIOR >>>
+        // =========================================================
+        this.connection.on("chat", ev => {
+            broadcast({
+                type: "chat",
+                streamer: this.username,
+                nickname: ev.nickname,
+                user: ev.uniqueId,
+                comment: ev.comment,
+                pfp: getSafePFP(ev)
+            });
+        });
+
+        // =========================================================
+        //  <<< NOVO: EVENT LISTENER MEMBER (JOIN) INSERIDO AQUI >>>
+        // =========================================================
+        this.connection.on("member", ev => {
+            broadcast({
+                type: "member",
+                streamer: this.username,
+                nickname: ev.nickname,
+                user: ev.uniqueId,
+                memberCount: ev.memberCount,
+                pfp: getSafePFP(ev)
+            });
+        });
+        // =========================================================
 
         this.connection.on("gift", ev => {
             if (!ev.repeatEnd) return;
@@ -360,12 +389,27 @@ app.get("/simular/gift", (req, res) => {
     res.send("OK - Gift Simulado");
 });
 
+app.get("/simular/chat", (req, res) => {
+    broadcast({
+        type: "chat", streamer: SIM_USER, nickname: "Simulador Chat", user: "sim_chat", comment: "Olá, esse é um teste!", pfp: SIM_PFP
+    });
+    res.send("OK - Chat Simulado");
+});
+
+// --- NOVO: ROTA DE SIMULAÇÃO PARA MEMBER (JOIN) ---
+app.get("/simular/member", (req, res) => {
+    broadcast({
+        type: "member", streamer: SIM_USER, nickname: "Simulador Memb", user: "sim_memb", memberCount: 10, pfp: SIM_PFP
+    });
+    res.send("OK - Member (Join) Simulado");
+});
+
 // ------------------------------------------------------------
 // INICIAR SERVIDOR
 // ------------------------------------------------------------
 server.listen(PORT, () => {
     console.log("==================================================");
-    console.log("PORTA LIDA DO AMBIENTE:", PORT); // LOG DE CONFIRMAÇÃO
+    console.log("PORTA LIDA DO AMBIENTE:", PORT);
     console.log("🟢 ULTRA SERVER ONLINE na porta:", PORT);
     console.log("==================================================");
 });
