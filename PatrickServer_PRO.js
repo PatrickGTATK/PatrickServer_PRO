@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
-import { WebcastPushConnection } from "./tiktok-live-connector/index.js";
+import WebcastPushConnection from "./tiktok-live-connector/index.js";
 import winston from "winston"; 
 import { URLSearchParams } from "url";
 
