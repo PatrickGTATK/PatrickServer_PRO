@@ -28,22 +28,17 @@ const logger = winston.createLogger({
 const PORT = process.env.PORT || 10000;
 const PROXY_URL = process.env.PROXY_URL || null; 
 const WS_SECRET = process.env.WS_SECRET || "123";
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin_secret_padrao_mude_isso";
 
-// NOVIDADE: Chave para proteger a rota de monitoramento /status
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin_secret_padrao_mude_isso"; 
-
-// Parâmetros de Resiliência/Backoff Exponencial
 const BASE_RECONNECT_DELAY_SECONDS = 15;
-const MAX_BACKOFF_DELAY_MINUTES = 60; 
-const MAX_CONSECUTIVE_FAILURES = 10; 
+const MAX_BACKOFF_DELAY_MINUTES = 60;
+const MAX_CONSECUTIVE_FAILURES = 10;
 
-// NOVIDADE: Tolerância a Falhas de Proxy
-const MAX_PROXY_FAILURES = 5; // Limite de falhas de proxy antes de tentar o fallback
-const PROXY_FALLBACK_DELAY_MINUTES = 15; // Tempo de espera na conexão direta antes de voltar ao proxy
+const MAX_PROXY_FAILURES = 5;
+const PROXY_FALLBACK_DELAY_MINUTES = 15;
 
-// Heartbeat
-const HEARTBEAT_INTERVAL = 30000; 
-const NO_PONG_TIMEOUT = 10000;    
+const HEARTBEAT_INTERVAL = 30000;
+const NO_PONG_TIMEOUT = 10000;
 
 // ------------------------------------------------------------
 // CARREGAR USUÁRIOS
@@ -52,377 +47,262 @@ let USERS = [];
 const USERS_JSON_STRING = process.env.USERS_JSON;
 
 if (USERS_JSON_STRING) {
-    try {
-        USERS = JSON.parse(USERS_JSON_STRING);
-        if (!Array.isArray(USERS)) {
-            throw new Error("O JSON da variável USERS_JSON não é um array de usuários.");
-        }
-        logger.info(`USERS_JSON (ENV) carregado: ${USERS.length} usuários.`);
-    } catch (e) {
-        logger.error(`ERRO CRÍTICO ao processar USERS_JSON (ENV).`, { error: e.message });
-        process.exit(1); 
-    }
+    try {
+        USERS = JSON.parse(USERS_JSON_STRING);
+        if (!Array.isArray(USERS)) throw new Error("USERS_JSON não é array.");
+        logger.info(`USERS_JSON carregado: ${USERS.length} usuários.`);
+    } catch (e) {
+        logger.error(`ERRO ao processar USERS_JSON: ${e.message}`);
+        process.exit(1);
+    }
 } else {
-    logger.warn("A variável de ambiente USERS_JSON não está configurada. O servidor iniciará sem conexões TikTok.");
+    logger.warn("USERS_JSON não configurado. Sem conexões TikTok.");
 }
 
-// Mapear conexões e sockets
-const tiktokConnections = new Map(); 
-const wsClients = new Map(); 
-
-// Mapear dados de controle de conexão
-const connectionMetrics = new Map(); // token -> { failures: 0, nextAttempt: 0, isPaused: false, lastSuccess: 0, proxyFailures: 0, usingDirect: false }
+const tiktokConnections = new Map();
+const wsClients = new Map();
+const connectionMetrics = new Map();
 
 const app = express();
 const server = http.createServer(app);
 
 // ------------------------------------------------------------
-// FUNÇÕES DE WEBSOCKET (HEARTBEAT)
+// HEARTBEAT WEBSOCKET
 // ------------------------------------------------------------
-
 function noop() {}
 function heartbeat() { this.isAlive = true; }
 
 const pingInterval = setInterval(() => {
-    wss.clients.forEach((ws) => {
+    wss.clients.forEach(ws => {
         if (ws.readyState === WebSocket.OPEN) {
-            if (ws.isAlive === false) {
-                return ws.terminate();
-            }
+            if (ws.isAlive === false) return ws.terminate();
             ws.isAlive = false;
-            ws.ping(noop); 
+            ws.ping(noop);
         }
     });
 }, HEARTBEAT_INTERVAL);
 
-server.on('close', () => {
-    clearInterval(pingInterval);
-});
+server.on("close", () => clearInterval(pingInterval));
 
 // ------------------------------------------------------------
-// FUNÇÃO AUXILIAR: CALCULAR DELAY EXPONENCIAL
+// CÁLCULO DO BACKOFF
 // ------------------------------------------------------------
 function calculateBackoffDelay(metrics) {
-    // Se estiver em modo de fallback direto e falhar, usa delay curto e volta para o proxy
-    if (metrics.usingDirect) {
-        return PROXY_FALLBACK_DELAY_MINUTES * 60; // 15 minutos de delay e então volta ao proxy
-    }
+    if (metrics.usingDirect) return PROXY_FALLBACK_DELAY_MINUTES * 60;
 
-    // Se falhou por proxy e atingiu o limite, usa delay do backoff normal
-    if (metrics.failures >= MAX_CONSECUTIVE_FAILURES) {
-        return MAX_BACKOFF_DELAY_MINUTES * 60; // Delay máximo (60 minutos)
-    }
+    if (metrics.failures >= MAX_CONSECUTIVE_FAILURES)
+        return MAX_BACKOFF_DELAY_MINUTES * 60;
 
-    // Backoff exponencial padrão
-    const delay = BASE_RECONNECT_DELAY_SECONDS * Math.pow(2, metrics.failures);
-    return Math.min(delay, MAX_BACKOFF_DELAY_MINUTES * 60);
+    return Math.min(
+        BASE_RECONNECT_DELAY_SECONDS * Math.pow(2, metrics.failures),
+        MAX_BACKOFF_DELAY_MINUTES * 60
+    );
 }
 
 // ------------------------------------------------------------
-// FUNÇÃO PRINCIPAL → Criar/Gerenciar conexão TikTok individual
+// FUNÇÃO PRINCIPAL DE CONEXÃO TIKTOK
 // ------------------------------------------------------------
 async function createTikTokConnection(token, tiktokUser) {
-    const metrics = connectionMetrics.get(token) || { 
-        failures: 0, 
-        nextAttempt: 0, 
-        isPaused: false, 
-        lastSuccess: 0, 
-        proxyFailures: 0, 
-        usingDirect: false 
+    const metrics = connectionMetrics.get(token) || {
+        failures: 0,
+        nextAttempt: 0,
+        isPaused: false,
+        lastSuccess: 0,
+        proxyFailures: 0,
+        usingDirect: false
     };
     connectionMetrics.set(token, metrics);
 
     if (metrics.isPaused) {
-        logger.warn(`Conexão @${tiktokUser} está PAUSADA (sem overlays). Não será iniciada.`, { token });
+        logger.warn(`Conexão @${tiktokUser} pausada.`, { token });
         return;
     }
 
-    // Determina a opção de proxy baseada nas métricas de falha
     let proxyOption = PROXY_URL || undefined;
-    if (metrics.usingDirect) {
-        // Se a métrica diz para usar a conexão direta, define como undefined
-        proxyOption = undefined;
-        logger.warn(`Conexão @${tiktokUser} usando o modo de FALLBACK (Conexão Direta).`, { token });
-    } else if (PROXY_URL) {
-        // Loga que está usando o proxy
-        logger.info(`Conexão @${tiktokUser} usando Proxy.`, { token });
-    }
-    
-    logger.info(`Iniciando conexão TikTok para: ${tiktokUser}`, { token });
+    if (metrics.usingDirect) proxyOption = undefined;
 
-    const client = new WebcastPushConnection(tiktokUser, {
-        processInitialData: true,
-        enableWebsocket: true,
-        proxy: proxyOption 
-    });
+    logger.info(`Conectando TikTok: @${tiktokUser}`, { token });
 
-    // --- EVENTOS DE CONTROLE DA CONEXÃO TIKTOK ---
-    
-    client.on("disconnected", () => {
-        // Lógica para detecção e transição de falha de proxy
+    const client = new WebcastPushConnection(tiktokUser, {
+        processInitialData: true,
+        enableWebsocket: true,
+        proxy: proxyOption
+    });
+
+    // ------ EVENTOS DE CONTROLE ------
+    client.on("disconnected", () => {
         let delay;
-        let logMessage;
-        
-        if (proxyOption && !metrics.usingDirect) { // Se falhou usando o proxy
+        let msg;
+
+        if (proxyOption && !metrics.usingDirect) {
             metrics.proxyFailures++;
             if (metrics.proxyFailures >= MAX_PROXY_FAILURES) {
-                // Ativamos o modo Fallback
                 metrics.usingDirect = true;
-                metrics.failures = 0; // Reseta falhas gerais no fallback
-                delay = BASE_RECONNECT_DELAY_SECONDS; // Tenta o fallback rápido
-                logMessage = `PROXY falhou ${metrics.proxyFailures}x. Iniciando FALLBACK para conexão DIRETA.`;
+                metrics.failures = 0;
+                delay = BASE_RECONNECT_DELAY_SECONDS;
+                msg = "Proxy falhou várias vezes. Usando fallback direto.";
             }
-        } else if (metrics.usingDirect) { // Se falhou usando a conexão direta (fallback)
-            // Reseta o modo Fallback e volta ao proxy com delay maior
-            metrics.usingDirect = false; 
+        } else if (metrics.usingDirect) {
+            metrics.usingDirect = false;
             metrics.proxyFailures = 0;
-            metrics.failures++; // Conta como falha geral
-            delay = PROXY_FALLBACK_DELAY_MINUTES * 60; // 15 minutos antes de voltar ao proxy
-            logMessage = `FALLBACK falhou. Voltando ao Proxy em ${PROXY_FALLBACK_DELAY_MINUTES} minutos.`;
+            metrics.failures++;
+            delay = PROXY_FALLBACK_DELAY_MINUTES * 60;
+            msg = "Fallback falhou. Voltando ao proxy.";
         }
 
-        // Se nenhuma transição de proxy ocorreu (apenas falha normal)
-        if (!logMessage) {
+        if (!msg) {
             metrics.failures++;
             delay = calculateBackoffDelay(metrics);
-            logMessage = metrics.failures >= MAX_CONSECUTIVE_FAILURES 
-                ? `Falhou ${metrics.failures} vezes. Usando delay MÁXIMO de ${MAX_BACKOFF_DELAY_MINUTES}m.`
-                : `Desconectada. Próxima tentativa em ${delay}s (Backoff Exp).`;
+            msg = `Desconectado. Tentando novamente em ${delay}s.`;
         }
-        
-        metrics.nextAttempt = Date.now() + (delay * 1000); 
-        connectionMetrics.set(token, metrics);
-        logger.warn(`Conexão @${tiktokUser} ${logMessage}`, { token, failures: metrics.failures, proxyFailures: metrics.proxyFailures });
-        
-        tiktokConnections.delete(token);
-        client.removeAllListeners(); 
 
-        setTimeout(() => {
-            createTikTokConnection(token, tiktokUser);
-        }, delay * 1000);
+        metrics.nextAttempt = Date.now() + delay * 1000;
+        logger.warn(msg, { token });
 
-        sendToToken(token, { type: "system", data: { status: "disconnected", user: tiktokUser, reconnectingIn: delay } });
-    });
-    
-    client.on("error", (err) => {
-        logger.error(`ERRO na conexão @${tiktokUser}: ${err.message}`, { token, error: err.message });
-        const errorMessage = err.message.substring(0, 150); 
-        sendToToken(token, { type: "system", data: { status: "error", user: tiktokUser, message: errorMessage } });
-    });
+        tiktokConnections.delete(token);
+        client.removeAllListeners();
 
-    // --- TENTAR CONECTAR ---
-    try {
-        await client.connect();
-        logger.info(`Conectado com sucesso: @${tiktokUser}`, { token });
-        
-        // Reseta as métricas após sucesso
+        setTimeout(() => createTikTokConnection(token, tiktokUser), delay * 1000);
+        sendToToken(token, { type: "system", data: { status: "disconnected", reconnectingIn: delay } });
+    });
+
+    client.on("error", err => {
+        logger.error(`Erro @${tiktokUser}: ${err.message}`, { token });
+    });
+
+    // ------ TENTAR CONECTAR ------
+    try {
+        await client.connect();
+        logger.info(`Conectado @${tiktokUser}`, { token });
+
         metrics.failures = 0;
-        metrics.nextAttempt = 0;
         metrics.proxyFailures = 0;
-        metrics.usingDirect = false; // Garante que volta ao proxy após sucesso
+        metrics.usingDirect = false;
         metrics.lastSuccess = Date.now();
+
         connectionMetrics.set(token, metrics);
+        tiktokConnections.set(token, client);
 
-        // Registra eventos de DADOS SOMENTE APÓS CONEXÃO BEM-SUCEDIDA
-        client.on("chat", (msg) => { sendToToken(token, { type: "chat", data: msg }); });
-        client.on("gift", (msg) => { sendToToken(token, { type: "gift", data: msg }); });
-        client.on("like", (msg) => { sendToToken(token, { type: "like", data: msg }); });
-        client.on("follow", (msg) => { sendToToken(token, { type: "follow", data: msg }); });
-        client.on("share", (msg) => { sendToToken(token, { type: "share", data: msg }); });
-        client.on("viewer", (msg) => { sendToToken(token, { type: "viewer", data: msg }); });
-        
-        tiktokConnections.set(token, client);
-        sendToToken(token, { type: "system", data: { status: "connected", user: tiktokUser } });
+        // Eventos TikTok
+        const events = ["chat", "gift", "like", "follow", "share", "viewer"];
+        events.forEach(evt =>
+            client.on(evt, msg => sendToToken(token, { type: evt, data: msg }))
+        );
 
-    } catch (err) {
-        logger.error(`Falha ao conectar @${tiktokUser} na tentativa inicial.`, { token, error: err.message });
-        
-        client.removeAllListeners(); 
-        client.disconnect(); // Dispara o evento "disconnected" para iniciar o ciclo de reconexão
-    }
+    } catch (err) {
+        logger.error(`Falha ao conectar @${tiktokUser}`, { token });
+        client.disconnect();
+    }
 }
 
 // ------------------------------------------------------------
-// FUNÇÃO → enviar evento para todos os overlays do token
+// ENVIO PARA OVERLAYS
 // ------------------------------------------------------------
 function sendToToken(token, payload) {
-    const clients = wsClients.get(token);
-    if (!clients) return;
-
-    const json = JSON.stringify(payload);
-    for (const ws of clients) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(json);
-    }
+    const clients = wsClients.get(token);
+    if (!clients) return;
+    for (const ws of clients)
+        if (ws.readyState === WebSocket.OPEN)
+            ws.send(JSON.stringify(payload));
 }
 
 // ------------------------------------------------------------
-// INICIAR conexões TikTok para todos os usuários ativos
+// INICIAR TODAS AS CONEXÕES TIKTOK
 // ------------------------------------------------------------
 async function startAllConnections() {
-    if (USERS.length === 0) {
-        logger.warn("Lista de usuários vazia. Nenhuma conexão será iniciada.");
-        return;
-    }
-
-    for (const user of USERS) {
-        if (user.active !== true && user.ativo !== true) continue; 
-
-        connectionMetrics.set(user.token, { 
-            failures: 0, 
-            nextAttempt: 0, 
-            isPaused: false, 
+    for (const user of USERS) {
+        if (user.active !== true) continue;
+        connectionMetrics.set(user.token, {
+            failures: 0,
+            nextAttempt: 0,
+            isPaused: false,
             lastSuccess: 0,
             proxyFailures: 0,
             usingDirect: false
         });
-
-        await createTikTokConnection(user.token, user.tiktokUser);
-    }
+        await createTikTokConnection(user.token, user.tiktokUser);
+    }
 }
 startAllConnections();
 
 // ------------------------------------------------------------
-// MIDDLEWARE DE SEGURANÇA: Proteger Rota de Status
+// AUTENTICAÇÃO ADMIN
 // ------------------------------------------------------------
 function authenticateAdmin(req, res, next) {
-    const adminSecretHeader = req.headers['x-admin-secret'];
-    
-    if (adminSecretHeader === ADMIN_SECRET) {
-        next();
-    } else {
-        logger.warn('Acesso não autorizado à rota /status.');
-        res.status(401).send('Acesso não autorizado. Chave de administrador ausente ou inválida.');
-    }
+    if (req.headers["x-admin-secret"] !== ADMIN_SECRET)
+        return res.status(401).send("Acesso não autorizado.");
+    next();
 }
 
 // ------------------------------------------------------------
 // ROTAS HTTP
 // ------------------------------------------------------------
-app.get("/", (req, res) => {
-    res.send("🟢 PatrickServer_PRO — ONLINE");
+app.get("/", (_, res) => {
+    res.send("🟢 PatrickServer_PRO — ONLINE");
 });
 
-// Rota de Status de Conexão (Monitoramento) - AGORA PROTEGIDA!
-app.get("/status", authenticateAdmin, (req, res) => {
-    const now = Date.now();
-    const connectionsStatus = USERS.map(user => {
-        const isConnected = tiktokConnections.has(user.token);
-        const activeOverlays = wsClients.get(user.token)?.size || 0;
-        const metrics = connectionMetrics.get(user.token) || { failures: 0, nextAttempt: 0, isPaused: false, lastSuccess: 0, proxyFailures: 0, usingDirect: false };
-        
-        let detailedStatus = "Conexão Ativa";
-        if (metrics.isPaused) {
-            detailedStatus = "PAUSADA (Sem Overlays)";
-        } else if (!isConnected && metrics.failures > 0) {
-            const nextAttemptDate = new Date(metrics.nextAttempt).toLocaleTimeString('pt-BR');
-            
-            if (metrics.usingDirect) {
-                 detailedStatus = `FALLBACK DIRETO: ${metrics.proxyFailures} falhas. Próx. Tentativa: ${nextAttemptDate}`;
-            } else if (metrics.nextAttempt > now) {
-                detailedStatus = `FALHA (${metrics.failures}x, Proxy ${metrics.proxyFailures}x). Próx. Tentativa: ${nextAttemptDate}`;
-            } else {
-                 detailedStatus = `FALHA (${metrics.failures}x). Reconectando AGORA.`;
-            }
+// --------- ROTA WEBHOOK EULER (AQUI ESTÁ O QUE VOCÊ PEDIU!) ---------
+app.post("/webhook", express.json(), (req, res) => {
+    logger.info("📩 Webhook Euler recebido.");
+
+    const payload = req.body;
+
+    // Enviar para TODOS os tokens ativos
+    USERS.forEach(user => {
+        if (user.active === true) {
+            sendToToken(user.token, {
+                type: "euler",
+                data: payload
+            });
         }
+    });
 
-        return {
-            tiktokUser: user.tiktokUser,
-            token: user.token,
-            active: user.active === true || user.ativo === true,
-            status: detailedStatus,
-            activeOverlays: activeOverlays,
-            consecutiveFailures: metrics.failures,
-            proxyFailures: metrics.proxyFailures,
-            proxyMode: metrics.usingDirect ? 'DIRETO (Fallback)' : (PROXY_URL ? 'PROXY' : 'DIRETO'),
-            lastSuccessfulConnection: metrics.lastSuccess ? new Date(metrics.lastSuccess).toLocaleString('pt-BR') : 'N/A'
-        };
-    });
-    
-    res.json({
-        serverStatus: "ONLINE",
-        proxyConfig: PROXY_URL ? "ATIVO" : "INATIVO",
-        totalUsers: USERS.length,
-        activeTikTokConnections: tiktokConnections.size,
-        activeWsClients: wss.clients.size,
-        connections: connectionsStatus
-    });
+    res.status(200).send("OK");
 });
 
-// Overlay por token
-app.use("/overlay", express.static("./overlay")); 
+// Status (protegido)
+app.get("/status", authenticateAdmin, (req, res) => {
+    res.json({
+        server: "ONLINE",
+        totalUsers: USERS.length,
+        wsClients: wss.clients.size
+    });
+});
+
+// Overlays públicos
+app.use("/overlay", express.static("./overlay"));
 
 // ------------------------------------------------------------
-// WEBSOCKET PARA OS OVERLAYS
+// WEBSOCKET OVERLAYS
 // ------------------------------------------------------------
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws, req) => {
-    // Heartbeat setup
     ws.isAlive = true;
-    ws.on('pong', heartbeat);
-    
-    const params = new URLSearchParams(req.url.replace("/ws?", ""));
-    const token = params.get("token");
-    const secret = params.get("secret");
+    ws.on("pong", heartbeat);
 
-    if (secret !== WS_SECRET) {
-        ws.close();
-        logger.warn(`Tentativa de conexão WS bloqueada (Secret Inválida)`);
-        return;
-    }
-    
-    if (!token) {
-        ws.close();
-        logger.warn(`Tentativa de conexão WS bloqueada (Token Ausente)`);
-        return;
-    }
+    const params = new URLSearchParams(req.url.replace("/ws?", ""));
+    const token = params.get("token");
+    const secret = params.get("secret");
 
-    // ... [Restante da lógica de conexão WS e Pausa/Unpause] ...
+    if (secret !== WS_SECRET) return ws.close();
+    if (!token) return ws.close();
 
-    // Recupera o usuário
-    const user = USERS.find(u => u.token === token);
-    if (!user || (user.active !== true && user.ativo !== true)) {
-        ws.close();
-        logger.warn(`Conexão WS bloqueada (Token não ativo): ${token}`);
-        return;
-    }
+    const user = USERS.find(u => u.token === token && u.active === true);
+    if (!user) return ws.close();
 
-    // Gerenciamento de Pausa/Unpause
-    const metrics = connectionMetrics.get(token);
-    if (metrics && metrics.isPaused) {
-        // Se estava pausado, reativa e tenta iniciar a conexão TikTok
-        metrics.isPaused = false;
-        createTikTokConnection(token, user.tiktokUser);
-        logger.info(`Conexão @${user.tiktokUser} REATIVADA devido a novo overlay.`, { token });
-    }
+    if (!wsClients.has(token)) wsClients.set(token, new Set());
+    wsClients.get(token).add(ws);
 
-    // Registrar cliente
-    if (!wsClients.has(token)) wsClients.set(token, new Set());
-    wsClients.get(token).add(ws);
+    logger.info(`Overlay conectado (${token})`);
 
-    logger.info(`Overlay conectado → token: ${token} | Total p/ token: ${wsClients.get(token).size}`, { token });
-
-    ws.on("close", () => {
-        wsClients.get(token)?.delete(ws);
-        clearTimeout(ws.pingTimeout); 
-        
-        const remainingClients = wsClients.get(token)?.size || 0;
-        logger.info(`Overlay desconectado → token: ${token} | Restantes: ${remainingClients}`, { token });
-        
-        // Pausa a conexão TikTok se não houver mais overlays
-        if (remainingClients === 0 && tiktokConnections.has(token)) {
-            const client = tiktokConnections.get(token);
-            client.removeAllListeners();
-            client.disconnect();
-            tiktokConnections.delete(token);
-
-            if (metrics) metrics.isPaused = true;
-            logger.warn(`Conexão @${user.tiktokUser} PAUSADA. Zero overlays ativos.`, { token });
+    ws.on("close", () => {
+        wsClients.get(token)?.delete(ws);
+        if (wsClients.get(token)?.size === 0) {
+            logger.warn(`Nenhum overlay ativo. Pausando TikTok ${user.tiktokUser}.`);
+            tiktokConnections.get(token)?.disconnect();
+            connectionMetrics.get(token).isPaused = true;
         }
-    });
-
-    ws.on('error', (error) => {
-        logger.error(`Erro no WS do token ${token}: ${error.message}`, { token, error: error.message });
     });
 });
 
@@ -430,5 +310,5 @@ wss.on("connection", (ws, req) => {
 // INICIAR SERVIDOR
 // ------------------------------------------------------------
 server.listen(PORT, () => {
-    logger.info(`PatrickServer_PRO rodando na porta ${PORT}`);
+    logger.info(`PatrickServer_PRO iniciado na porta ${PORT}`);
 });
